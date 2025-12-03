@@ -1,0 +1,166 @@
+name: Tourism Project Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.10"
+
+jobs:
+
+  register-dataset:
+    name: Register dataset -> HF
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism_project/requirements.txt
+
+      - name: Register dataset on Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -f "tourism_project/model_building/data_register.py" ]; then
+            python tourism_project/model_building/data_register.py
+          else
+            echo "data_register.py not found — skipping dataset registration."
+          fi
+
+
+  data-prep:
+    name: Data Preparation
+    needs: register-dataset
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism_project/requirements.txt
+
+      - name: Run Data Preparation
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -f "tourism_project/model_building/data_cleaning.py" ]; then
+            python tourism_project/model_building/data_cleaning.py
+          elif [ -f "tourism_project/model_building/prep.py" ]; then
+            python tourism_project/model_building/prep.py
+          else
+            echo "No data preparation script found — skipping."
+          fi
+
+      - name: Upload processed data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data
+          path: tourism_project/data/processed
+
+
+  model-training:
+    name: Model Training & MLflow Logging
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism_project/requirements.txt
+
+      - name: Prepare MLflow directory
+        run: mkdir -p mlruns
+
+      - name: Run model training
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MLFLOW_TRACKING_URI: file://${{ github.workspace }}/mlruns
+        run: |
+          if [ -f "tourism_project/model_building/train.py" ]; then
+            python tourism_project/model_building/train.py
+          else
+            echo "Training script not found. Please ensure train.py exists."
+            exit 1
+          fi
+
+      - name: Upload MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-artifacts
+          path: mlruns
+
+      - name: Upload trained model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: mlops/model_building/artifacts
+
+
+  deploy-hosting:
+    name: Deploy to Hugging Face Space
+    needs: [model-training, data-prep, register-dataset]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tourism_project/requirements.txt
+
+      - name: Deploy to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+          SPACE_SDK: ${{ secrets.SPACE_SDK || 'docker' }}
+          SPACE_PRIVATE: ${{ secrets.SPACE_PRIVATE || 'false' }}
+          LOCAL_DEPLOY_FOLDER: tourism_project/deployment
+        run: |
+          if [ -z "$HF_SPACE_ID" ]; then
+            echo "ERROR: HF_SPACE_ID secret is missing. Set it to: username/space-name"
+            exit 1
+          fi
+
+          if [ ! -d "$LOCAL_DEPLOY_FOLDER" ]; then
+            echo "ERROR: Deployment folder $LOCAL_DEPLOY_FOLDER not found."
+            exit 1
+          fi
+
+          python tourism_project/hosting/hosting.py
